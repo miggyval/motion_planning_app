@@ -101,8 +101,8 @@ class App:
         self.cost_smooth_max = 2.0    # peak shoulder multiplier at boundary
         
         # RRT mode + dynamics
-        self.rrt_variant = "RRT"        # or "RRT"
-        self.rrt_dynamics = "euclid"       # "diff" (unicycle) or "euclid" (straight-line)
+        self.rrt_variant = "RRT"          # or "RRT*"
+        self.rrt_dynamics = "euclid"      # "diff" (unicycle) or "euclid" (straight-line)
         self.rrt_start_theta = 0.0
         self.rrt_goal_radius = 15.0
         self.rrt_T = 0.5
@@ -110,6 +110,7 @@ class App:
         self.rrt_omegas = [-1.2, -0.6, 0.0, 0.6, 1.2]
         self.rrt_v = None                # None → auto v ≈ step / T
 
+        self.rrt_path_edges: List[List[Tuple[int,int]]] = []
 
         cv2.namedWindow(WINDOW)
         cv2.setMouseCallback(WINDOW, self.on_mouse)
@@ -216,6 +217,7 @@ class App:
         self.rrt_edges = []
         self.rrt_nodes_xy = None
         self.rrt_goal_connected = False
+        self.rrt_path_edges = []
 
     def mark_prm_dirty(self):
         self.prm_dirty = True
@@ -344,7 +346,9 @@ class App:
         H, W = self.mask.shape
         if not (0 <= sx < W and 0 <= sy < H and 0 <= gx < W and 0 <= gy < H):
             self.is_running = False; self.is_building = False; return
-        if self.mask[sy, sx] or self.mask[gy, gx]:
+        if self.mask[sy, sx] or self.mask[gy, gy if False else gx]:  # keep shape safe
+            self.is_running = False; self.is_building = False; return
+        if self.mask[gy, gx]:
             self.is_running = False; self.is_building = False; return
 
         rng = np.random.default_rng()
@@ -513,9 +517,14 @@ class App:
             gx, gy = self.rc_center_px(*self.goal)
 
             def animate_cb(nodes_xy, edges_draw, goal_idx):
-                # Store for draw()
-                self.rrt_nodes_xy = np.array(nodes_xy, dtype=np.int32)
-                self.rrt_edges = list(edges_draw)
+                # Store for draw() during animation (cast to int for OpenCV)
+                if nodes_xy is not None:
+                    self.rrt_nodes_xy = np.array(nodes_xy, dtype=np.int32)
+                if edges_draw is not None:
+                    self.rrt_edges = [
+                        ((int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])))
+                        for (p0, p1) in edges_draw
+                    ]
                 self.rrt_goal_connected = (goal_idx is not None)
                 cv2.imshow(WINDOW, self.draw())
                 k = cv2.waitKey(1) & 0xFF
@@ -524,6 +533,7 @@ class App:
                     return False
                 if k == 32:
                     self.cancel_requested = True
+                # If we reached goal and user asked to cancel, stop early
                 if goal_idx is not None and self.cancel_requested:
                     return False
                 return True
@@ -532,7 +542,7 @@ class App:
                 return self.cancel_requested
 
             func = rrt_star if self.rrt_variant == "RRT*" else rrt
-            path_px, edges, nodes_xy = func(
+            path_px, edges, nodes_xy, path_edges = func(
                 self.mask, (sx, sy), (gx, gy), self.allow_diag,
                 iters=self.rrt_iters, step=self.rrt_step,
                 radius=self.rrt_radius, goal_bias=self.rrt_goal_bias,
@@ -545,11 +555,19 @@ class App:
                 T=self.rrt_T,
                 dt=self.rrt_dt
             )
-            self.path_px = path_px
-            self.rrt_edges = edges
-            self.rrt_nodes_xy = nodes_xy
-            self.rrt_goal_connected = len(path_px) >= 2
 
+            # --- Make everything int for drawing ---
+            self.path_px = [(int(x), int(y)) for (x, y) in (path_px or [])]
+            self.rrt_edges = [
+                ((int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])))
+                for (p0, p1) in (edges or [])
+            ]
+            self.rrt_nodes_xy = np.array(nodes_xy, dtype=np.int32) if nodes_xy is not None else None
+            self.rrt_path_edges = [
+                [(int(px), int(py)) for (px, py) in seg]
+                for seg in (path_edges or [])
+            ]
+            self.rrt_goal_connected = len(self.path_px) >= 2
 
         img = self.draw()
         no_path = ((self.planner == "GRID" and not self.path_cells) or
@@ -747,20 +765,26 @@ class App:
                 x, y = self.nodes_xy[idx]
                 cv2.circle(img, (int(x), int(y)), 3, COL_PRM_VIS, -1, cv2.LINE_AA)
             if len(self.path_px) >= 2:
-                for i in range(len(self.path_px) - 1):
-                    cv2.line(img, self.path_px[i], self.path_px[i+1], COL_PATH, 2, cv2.LINE_AA)
+                cv2.polylines(img, [np.array(self.path_px, np.int32)], False, COL_PATH, 2, cv2.LINE_AA)
 
-        # RRT* overlays
+        # RRT overlays
         if self.planner == "RRT":
-            for (p0, p1) in self.rrt_edges:
-                cv2.line(img, p0, p1, COL_PRM_EDGE, 1, cv2.LINE_AA)
-            if self.rrt_nodes_xy is not None:
-                for (x, y) in self.rrt_nodes_xy:
-                    cv2.circle(img, (int(x), int(y)), 2, (90, 90, 255), -1, cv2.LINE_AA)
+            # During animation we still draw the growing tree (already int-cast)
+            if self.is_running:
+                for (p0, p1) in self.rrt_edges:
+                    cv2.line(img, p0, p1, COL_PRM_EDGE, 1, cv2.LINE_AA)
+                if self.rrt_nodes_xy is not None:
+                    for (x, y) in self.rrt_nodes_xy:
+                        cv2.circle(img, (int(x), int(y)), 2, (90, 90, 255), -1, cv2.LINE_AA)
+
+            # Draw only the chosen path (works for euclid or diff)
             if len(self.path_px) >= 2:
-                for i in range(len(self.path_px) - 1):
-                    cv2.line(img, self.path_px[i], self.path_px[i+1], COL_PATH, 2, cv2.LINE_AA)
-                
+                if self.rrt_dynamics == "diff" and self.rrt_path_edges:
+                    for traj in self.rrt_path_edges:
+                        if len(traj) >= 2:
+                            cv2.polylines(img, [np.array(traj, np.int32)], False, COL_PATH, 2, cv2.LINE_AA)
+                else:
+                    cv2.polylines(img, [np.array(self.path_px, np.int32)], False, COL_PATH, 2, cv2.LINE_AA)
 
         # Line preview
         for (r, c) in self.preview_points:
@@ -797,7 +821,7 @@ class App:
             hud2 = f"Planner: {self.planner}{'*' if (self.planner == 'RRT' and self.rrt_variant == 'RRT*') else ''} |  Grid: {R}x{C}  |  Canvas: {CANVAS_H}x{CANVAS_W}  |  {spec}"
             hud3 = "1:Start 2:Goal 3:Draw 4:Erase 5:Line-Draw 6:Line-Erase (Shift+3/4=Line)  A:A*  D:Dijkstra  8:Toggle 8-way  H:Hide Help"
             if self.planner == "RRT":
-                hud4 = "RRT: T/t iters  U/u step  Y/y radius  J/j bias%   Space: Run/Cancel   P:Planner  C:RstPath"
+                hud4 = "RRT: T/t iters  U/u step  Y/y radius  J/j bias%   Space: Run/Cancel   P:Planner  C:RstPath  V:RRT/RRT*  F:euclid/diff"
             else:
                 hud4 = "c:Costmap  C:RstPath  0/9: finer/coarser grid (+2,+3 / -2,-3)  P:Planner  B:Build PRM (= skip)  =/-:N  ]/[ :k  ./, :radius  R:Reset  G:Grid  S:Save  L:Load  Esc/Q:Quit"
             for i, line in enumerate([hud1, hud2, hud3, hud4]):
@@ -826,10 +850,8 @@ class App:
             if self.planner == "PRM" and self.is_building:
                 msg = "BUILDING PRM (B to skip)"
             elif self.planner == "RRT":
-                if self.rrt_variant == "RRT*":
-                    msg = "RUNNING RRT* (Space to cancel)"
-                else:
-                    msg = "RUNNING RRT (Space to cancel)"
+                msg = "RUNNING RRT*" if self.rrt_variant == "RRT*" else "RUNNING RRT"
+                msg += " (Space to cancel)"
             else:
                 msg = "RUNNING (Space to cancel)"
             cv2.putText(img, msg, (8, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,50), 1, cv2.LINE_AA)
@@ -927,7 +949,7 @@ class App:
             elif key == ord('.'): self.prm_radius = min(self.prm_radius + 10, 2000); self.clear_path_overlay(); self.mark_prm_dirty()
             elif key == ord(','): self.prm_radius = max(self.prm_radius - 10, 10);   self.clear_path_overlay(); self.mark_prm_dirty()
 
-            # RRT* params
+            # RRT / RRT* params
             elif key == ord('T'): self.rrt_iters = min(self.rrt_iters + 500, 20000)
             elif key == ord('t'): self.rrt_iters = max(self.rrt_iters - 500, 200)
             elif key == ord('U'): self.rrt_step  = min(self.rrt_step  + 5, 200)
@@ -936,18 +958,14 @@ class App:
             elif key == ord('y'): self.rrt_radius = max(self.rrt_radius - 5, 5)
             elif key == ord('J'): self.rrt_goal_bias = min(self.rrt_goal_bias + 0.01, 0.50)
             elif key == ord('j'): self.rrt_goal_bias = max(self.rrt_goal_bias - 0.01, 0.00)
+            elif key == ord('V'): self.rrt_variant = "RRT" if self.rrt_variant == "RRT*" else "RRT*"
+            elif key == ord('F'): self.rrt_dynamics = "euclid" if self.rrt_dynamics == "diff" else "diff"
 
             # Grid discretization: keep 2:3 aspect by stepping +2 rows / +3 cols
             elif key == ord('0'):   # finer
                 self.resize_grid(+2, +3)
             elif key == ord('9'):   # coarser
                 self.resize_grid(-2, -3)
-                
-            elif key == ord('V'):
-                self.rrt_variant = "RRT" if self.rrt_variant == "RRT*" else "RRT*"
-            elif key == ord('F'):
-                self.rrt_dynamics = "euclid" if self.rrt_dynamics == "diff" else "diff"
-
 
         cv2.destroyAllWindows()
 
